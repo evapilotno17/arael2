@@ -1,0 +1,464 @@
+// ===== TOKEN USAGE (≈) =====
+//     341  keylogger/keylog.py
+//     223  linux/keylog.c
+//     216  macos/keylog.c
+//     206  keylogger/typing_speed.py
+//      63  keylogger/db.py
+//      55  macos/Makefile
+//      41  linux/Makefile
+//       1  keylogger/.keylog.pid
+//       1  keylogger/__init__.py
+// ───────────────────────────
+//    1147  TOTAL
+
+
+// ===== BEGIN: macos/Makefile =====
+CC      = clang
+CFLAGS  = -O2 -std=c11
+SRC     = keylog.c
+OUT     = keylog.exe  # exe because it makes it easier to ignore in vomitignore
+LIBS    = -lsqlite3 -framework ApplicationServices # sqlite3 is in default libs; ApplicationServices gives us the event tap
+
+all: $(OUT)
+
+$(OUT): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) $(LIBS) -o $(OUT)
+
+clean:
+	rm -f $(OUT)
+// ===== END  : macos/Makefile =====
+
+
+// ===== BEGIN: macos/keylog.c =====
+/* ./macos/keylog */
+
+#define _POSIX_C_SOURCE 199309L
+
+#include <ApplicationServices/ApplicationServices.h>
+#include <errno.h>
+#include <signal.h>
+#include <sqlite3.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DB_DIR  "../keydb"
+#define DB_PATH DB_DIR "/keys.db"
+#define BATCH   256
+
+static volatile sig_atomic_t stop = 0;
+static sqlite3 *db=NULL; static sqlite3_stmt *st=NULL; static int queued=0;
+
+/* ---------- helpers ---------- */
+static void fatal(const char *m){ perror(m); exit(EXIT_FAILURE); }
+static void ensure_db_dir(void){ if(access(DB_DIR,F_OK)==-1 && mkdir(DB_DIR,0700)==-1 && errno!=EEXIST) fatal("mkdir db"); }
+static int64_t now_us(void){ struct timeval tv; gettimeofday(&tv,0); return (int64_t)tv.tv_sec*1000000LL+tv.tv_usec; }
+static void flush_batch(void){ if(queued){ sqlite3_exec(db,"commit; begin;",0,0,0); queued=0; } }
+static void handle_sig(int sig){ (void)sig; stop=1; }
+
+/* ---------- event‑tap callback ---------- */
+static CGEventRef tap_cb(CGEventTapProxy p,CGEventType t,CGEventRef e,void*ctx){
+    if(t==kCGEventKeyDown){
+        sqlite3_bind_int64(st,1,now_us());
+        sqlite3_bind_int  (st,2,(int)CGEventGetIntegerValueField(e,kCGKeyboardEventKeycode));
+        sqlite3_bind_text (st,3,"macos",-1,SQLITE_STATIC);
+        sqlite3_step(st); sqlite3_reset(st);
+        if(++queued>=BATCH) flush_batch();
+    }
+    if(stop){ CFRunLoopStop(CFRunLoopGetCurrent()); return NULL; }
+    return e;
+}
+
+int main(void)
+{
+    signal(SIGINT,handle_sig); signal(SIGTERM,handle_sig);
+    signal(SIGHUP,handle_sig); signal(SIGQUIT,handle_sig);
+
+    ensure_db_dir();
+
+    /* open / init sqlite */
+    if(sqlite3_open(DB_PATH,&db)!=SQLITE_OK) fatal("sqlite open");
+    sqlite3_exec(db,"pragma journal_mode=WAL;",0,0,0);
+    sqlite3_exec(db,
+        "create table if not exists keystrokes("
+        " ts_us integer,"
+        " code  integer,"
+        " os    text);",
+        0,0,0);
+    if(sqlite3_prepare_v2(db,"insert into keystrokes(ts_us, code, os) values (?,?,?);",-1,&st,0)!=SQLITE_OK) fatal("prepare");
+    sqlite3_exec(db,"begin;",0,0,0);
+
+    /* install event tap */
+    CGEventMask mask=CGEventMaskBit(kCGEventKeyDown);
+    CFMachPortRef tap=CGEventTapCreate(kCGSessionEventTap,kCGHeadInsertEventTap,0,mask,tap_cb,NULL);
+    if(!tap) fatal("event tap");
+
+    CFRunLoopSourceRef src=CFMachPortCreateRunLoopSource(kCFAllocatorDefault,tap,0);
+    CFRunLoopAddSource(CFRunLoopGetCurrent(),src,kCFRunLoopCommonModes);
+    CGEventTapEnable(tap,true);
+
+    CFRunLoopRun();                 /* blocks until stop==1 */
+
+    /* graceful shutdown */
+    flush_batch(); sqlite3_finalize(st); sqlite3_close(db);
+    fprintf(stderr,"\n[clean exit] keystrokes saved. goodbye.\n");
+    return 0;
+}
+// ===== END  : macos/keylog.c =====
+
+
+// ===== BEGIN: keylogger/typing_speed.py =====
+import sys, signal, numpy as np
+from datetime import datetime
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph as pg
+
+from src.db import SessionLocal      
+from src.models import Keystroke
+
+AVG_CHARS_PER_WORD = 5
+ROLLING_WINDOW     = 120
+QUERY_BATCH        = 30
+UPDATE_INTERVAL_MS = 200
+
+
+class _TypingSpeedGrapher:
+    def __init__(self):
+        self.db  = SessionLocal()
+
+
+        self.app = QtWidgets.QApplication(sys.argv)
+        self.app.setQuitOnLastWindowClosed(True)
+        self.app.aboutToQuit.connect(self._cleanup)
+
+        self.win  = pg.GraphicsLayoutWidget(show=True,
+                                            title="Live TypingSpeed Monitor")
+        self.win.resize(800, 400)
+
+        self.plot = self.win.addPlot(title=" WPM (rolling)")
+        self.plot.setLabel('left',   'WPM')
+        self.plot.setLabel('bottom', 'seconds ago')
+        self.plot.setYRange(0, 160)
+        self.plot.showGrid(x=True, y=True)
+
+        self.data  = np.zeros(ROLLING_WINDOW)
+        self.curve = self.plot.plot(self.data, pen='y')
+
+        # tick every UPDATE_INTERVAL_MS
+        self.timer          = QtCore.QTimer()
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(UPDATE_INTERVAL_MS)
+
+        # ctrlC - close the process (although thius wont work if you're running the process through ctl)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, self._sig_exit)
+
+    def _sig_exit(self, *_):
+        QtWidgets.QApplication.quit()
+
+    def _cleanup(self):
+        self.timer.stop()
+        self.db.close()
+
+    def _compute_wpm(self) -> float:
+        """pull the newest QUERY_BATCH keystrokes and convert to wpm."""
+        rows = (self.db.query(Keystroke.timestamp)
+                       .order_by(Keystroke.timestamp.desc())
+                       .limit(QUERY_BATCH)
+                       .all())
+        if len(rows) < 2:
+            return 0.0
+        newest = rows[0][0]
+        oldest = rows[-1][0]
+        elapsed = (newest - oldest).total_seconds()
+        if elapsed <= 0:
+            return 0.0
+        now = datetime.now()
+        elapsed_from_cur = (now - oldest).total_seconds()
+
+        kps = len(rows) / elapsed_from_cur
+        return (kps * 60) / AVG_CHARS_PER_WORD
+
+    def _tick(self):
+        wpm = self._compute_wpm()
+        self.data = np.roll(self.data, -1)
+        self.data[-1] = wpm
+        self.curve.setData(self.data)
+
+    def run(self):
+        sys.exit(self.app.exec_())
+
+
+def main():
+    _TypingSpeedGrapher().run()
+
+if __name__ == "__main__":
+    main()
+// ===== END  : keylogger/typing_speed.py =====
+
+
+// ===== BEGIN: keylogger/.keylog.pid =====
+1749659
+// ===== END  : keylogger/.keylog.pid =====
+
+
+// ===== BEGIN: keylogger/keylog.py =====
+#!/usr/bin/env python3
+"""
+keylog.py – minimal python wrapper that picks the right C keylogger
+           (linux or macOS) and manages its lifetime.
+
+requirements: only the std‑lib
+"""
+
+import glob
+import os
+import platform
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# --------------------------------------------------------------------
+# config – edit if your tree layout changes
+# --------------------------------------------------------------------
+LINUX_BIN  = Path(__file__).parent.with_name("linux") / "keylog.exe"      # compiled binary
+MACOS_BIN  = Path(__file__).parent.with_name("macos") / "keylog.exe"      # compiled binary
+PID_FILE   = Path(__file__).with_name(".keylog.pid")           # store child pid
+# --------------------------------------------------------------------
+
+
+def detect_os() -> str:
+    """return 'linux' or 'macos' (darwin). exit for anything else."""
+    name = platform.system().lower()
+    if name.startswith("linux"):
+        return "linux"
+    if name.startswith("darwin"):
+        return "macos"
+    sys.exit(f"unsupported os: {platform.system()}")
+
+
+def find_keyboard_device() -> str:
+    """for linux: pick the first by‑path symlink ending in -kbd."""
+    paths = sorted(glob.glob("/dev/input/by-path/*-kbd"))
+    if not paths:
+        sys.exit("no keyboard event device found (glob /dev/input/by-path/*-kbd)")
+    return os.path.realpath(paths[0])
+
+
+def is_running() -> bool:
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text())
+            os.kill(pid, 0)        # check signal 0
+            return pid
+        except (ValueError, ProcessLookupError, PermissionError):
+            PID_FILE.unlink(missing_ok=True)
+            return 0
+    return 0
+
+
+def start():
+    if is_running():
+        print("keylogger already running")
+        return
+
+    os_type = detect_os()
+    if os_type == "linux":
+        bin_path = LINUX_BIN
+        device   = find_keyboard_device()
+        cmd      = [str(bin_path), device]
+        sudo     = os.geteuid() != 0 and not os.access(device, os.R_OK)
+    else:  # macos
+        bin_path = MACOS_BIN
+        cmd      = [str(bin_path)]
+        sudo     = False           # not needed; event‑tap runs as user
+
+    if not bin_path.exists():
+        sys.exit(f"binary not found: {bin_path}. compile it first.")
+
+    if sudo:
+        cmd.insert(0, "sudo")
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,    # decouple from this tty
+    )
+
+    PID_FILE.write_text(str(proc.pid))
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        PID_FILE.unlink(missing_ok=True)
+        sys.exit("keylogger failed to start (check binary manually)")
+    print(f"arael has awakened and is running at [{proc.pid}] ({os_type})")
+
+
+def stop():
+    if not PID_FILE.exists():
+        print("no pidfile → not running?")
+        return
+    pid = int(PID_FILE.read_text())
+    try:
+        os.kill(pid, signal.SIGINT)
+    except ProcessLookupError:
+        print("process already gone")
+    PID_FILE.unlink(missing_ok=True)
+    print("keylogger stopped")
+
+
+def status():
+    pid = is_running()
+    print(f"arael is running at pid {pid}" if pid else "arael is not running")
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in {"start", "stop", "status"}:
+        print("usage: python keylog.py [start|stop|status]")
+        sys.exit(1)
+    {"start": start, "stop": stop, "status": status}[sys.argv[1]]()
+
+
+if __name__ == "__main__":
+    main()
+// ===== END  : keylogger/keylog.py =====
+
+
+// ===== BEGIN: keylogger/__init__.py =====
+
+// ===== END  : keylogger/__init__.py =====
+
+
+// ===== BEGIN: keylogger/db.py =====
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from pathlib import Path
+from sqlalchemy import Column, Integer, String
+from sqlalchemy.orm import declarative_base
+
+db_file = Path(__file__).parent / "keydb" / "keys.db"
+DB_PATH = f"sqlite:///{db_file}"
+
+engine = create_engine(DB_PATH, echo=False)
+SessionLocal = sessionmaker(bind=engine)
+
+Base = declarative_base()
+
+class Keystroke(Base):
+    __tablename__ = 'keystrokes'
+
+    ts_us = Column(Integer, primary_key=True, index=True)
+    code = Column(Integer, nullable=False)
+    os = Column(String, nullable=False)
+
+
+def init_db():
+    Base.metadata.create_all(bind=engine)
+// ===== END  : keylogger/db.py =====
+
+
+// ===== BEGIN: linux/Makefile =====
+CC      = gcc
+CFLAGS  = -O2 -std=c11
+LIBS    = -lsqlite3
+SRC     = keylog.c
+OUT     = keylog.exe # exe because it makes it easier to ignore in vomitignore
+
+all: $(OUT)
+
+$(OUT): $(SRC)
+	$(CC) $(CFLAGS) $(SRC) $(LIBS) -o $(OUT)
+
+clean:
+	rm -f $(OUT)
+// ===== END  : linux/Makefile =====
+
+
+// ===== BEGIN: linux/keylog.c =====
+/* sudo ./keylog.exe /dev/input/by-path/*-kbd */
+
+#define _POSIX_C_SOURCE 199309L
+
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <signal.h>
+#include <sqlite3.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#define DB_DIR  "../keydb"
+#define DB_PATH DB_DIR "/keys.db"
+#define BATCH   256
+
+static volatile sig_atomic_t stop = 0;
+
+/* ---------- helpers ---------- */
+static void handle_sig(int sig)               { (void)sig; stop = 1; }
+static void fatal(const char *m)              { perror(m); exit(EXIT_FAILURE); }
+static void ensure_db_dir(void)               { if (access(DB_DIR,F_OK)==-1 && mkdir(DB_DIR,0700)==-1 && errno!=EEXIST) fatal("mkdir db"); }
+static int64_t tv_to_us(const struct timeval *t){ return (int64_t)t->tv_sec*1000000LL + t->tv_usec; }
+
+int main(int argc,char **argv)
+{
+    if(argc<2){ fprintf(stderr,"device path required (e.g. /dev/input/event3)\n"); return 1; }
+
+    signal(SIGINT,handle_sig); signal(SIGTERM,handle_sig);
+    signal(SIGHUP,handle_sig); signal(SIGQUIT,handle_sig);
+
+    ensure_db_dir();
+
+    /* open keyboard device */
+    int fd=open(argv[1],O_RDONLY|O_NONBLOCK); if(fd<0) fatal("open input");
+
+    /* open / init sqlite */
+    sqlite3 *db; if(sqlite3_open(DB_PATH,&db)!=SQLITE_OK) fatal("sqlite open");
+    sqlite3_exec(db,"pragma journal_mode=WAL;",0,0,0);
+    sqlite3_exec(db,
+        "create table if not exists keystrokes("
+        " ts_us integer,"
+        " code  integer,"
+        " os    text);",
+        0,0,0);
+
+    const char *sql="insert into keystrokes(ts_us, code, os) values (?,?,?);";
+    sqlite3_stmt *st; if(sqlite3_prepare_v2(db,sql,-1,&st,0)!=SQLITE_OK) fatal("prepare");
+    sqlite3_exec(db,"begin;",0,0,0);
+
+    struct input_event ev; int queued=0; struct timespec ts={0,1000000L};
+
+    while(!stop){
+        ssize_t n=read(fd,&ev,sizeof ev);
+        if(n==-1){
+            if(errno==EAGAIN||errno==EWOULDBLOCK){ nanosleep(&ts,0); continue; }
+            fatal("read");
+        }
+        if(n!=sizeof ev) continue;
+        if(ev.type==EV_KEY && ev.value==1){
+            sqlite3_bind_int64(st,1,tv_to_us(&ev.time));
+            sqlite3_bind_int  (st,2,ev.code);
+            sqlite3_bind_text (st,3,"linux",-1,SQLITE_STATIC);
+            sqlite3_step(st); sqlite3_reset(st);
+            if(++queued>=BATCH){ sqlite3_exec(db,"commit; begin;",0,0,0); queued=0; }
+        }
+    }
+
+    if(queued) sqlite3_exec(db,"commit;",0,0,0);
+    sqlite3_finalize(st); sqlite3_close(db); close(fd);
+    fprintf(stderr,"\n[clean exit] keystrokes saved. goodbye.\n");
+    return 0;
+}
+// ===== END  : linux/keylog.c =====
+

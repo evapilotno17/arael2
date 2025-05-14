@@ -1,0 +1,6 @@
+venv
+ipynb
+.exe
+vomit
+keydb
+pycache
