@@ -1,33 +1,23 @@
-from keylogger.db import Keystroke
-# from __future__ import annotations
+"""utils.py – high‑level helper for keystroke DB
+
+• loads the whole SQLite db into a pandas DataFrame on construction
+• expands cols → timestamp (datetime) + keystroke (unicode)
+• OS‑aware: full US‑ANSI code→glyph maps for Linux (evdev) and macOS (Quartz)
+   including all alphanumerics, punctuation, and common modifiers.
+"""
+from __future__ import annotations
+
 from pathlib import Path
 from typing import Dict
 from datetime import datetime
+
 import pandas as pd
 import sqlite3
 
-def convert_to_readable_key(key: Keystroke | tuple):
-    if type(key) == tuple:
-        # (rowid, ts_us, code, os)
-        return {
-            "key": MAP_BY_OS.get(key[3], {}).get(key[2], "<unknown>"),
-            "timestamp": datetime.fromtimestamp(key[1] / 1e6)
-        }
-    elif type(key) == Keystroke :
-        return {
-            "key": MAP_BY_OS.get(key.os, {}).get(key.code, "<unknown>"),
-            "timestamp": datetime.fromtimestamp(key.ts_us / 1e6)
-        }
-    elif type(key) == dict:
-        return {
-            "key": MAP_BY_OS.get(key["os"], {}).get(key["code"], "<unknown>"),
-            "timestamp": datetime.fromtimestamp(key["ts_us"] / 1e6)
-        }
-    raise ValueError("invalid keystroke")
-
-
-
-
+# ------------------------------------------------------------------
+# complete US‑ANSI key‑code → glyph maps
+# ------------------------------------------------------------------
+# linux / evdev (see include/uapi/linux/input-event-codes.h)
 LINUX_KEYMAP: Dict[int, str] = {
     # ─ letters ─
     16:"q",17:"w",18:"e",19:"r",20:"t",21:"y",22:"u",23:"i",24:"o",25:"p",
@@ -89,3 +79,43 @@ MAP_BY_OS = {
     "darwin": MAC_KEYMAP,  # alias for platform.system()
     "windows": WINDOWS_KEYMAP,
 }
+
+# ------------------------------------------------------------------
+# utils class
+# ------------------------------------------------------------------
+class Utils:
+    """Utility wrapper for keystroke SQLite db → pandas DataFrame."""
+
+    def __init__(self, db_path: str | Path | None = None):
+        if db_path is None:
+            db_path = Path(__file__).resolve().parent / "keydb" / "keys.db"
+        self.db_path = Path(db_path)
+        if not self.db_path.exists():
+            raise FileNotFoundError(self.db_path)
+        self.df = self._load()
+
+    # ---------- internal ----------
+    def _load(self) -> pd.DataFrame:
+        con = sqlite3.connect(self.db_path)
+        df  = pd.read_sql_query("SELECT ts_us, code, os FROM keystrokes", con)
+        con.close()
+        df["timestamp"] = pd.to_datetime(df["ts_us"], unit="us")
+        df["key"]       = df.apply(self._code_to_key, axis=1)
+        return df
+
+    @staticmethod
+    def _unknown(code: int) -> str:  # helper for unmapped codes
+        return f"<unk:{code}>"
+
+    def _code_to_key(self, row) -> str:
+        return MAP_BY_OS.get(row["os"].lower(), {}).get(row["code"], self._unknown(row["code"]))
+
+    # ---------- public ----------
+    def get_dataframe(self) -> pd.DataFrame:
+        return self.df.copy()
+
+    def refresh(self):
+        self.df = self._load()
+
+    def to_sequences(self) -> pd.DataFrame:
+        return self.df[["timestamp", "key"]].copy()

